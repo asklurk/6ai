@@ -20,23 +20,37 @@
                 <p class="lead text-muted">Where logic, creativity, technicality, philosophy, and humor converge.</p>
             </div>
 
+            <!-- Add CSRF protection message and retry button -->
+            <div id="auth-alert" class="alert alert-warning alert-dismissible fade show" style="display: none; max-width: 400px; margin: 0 auto 20px;">
+                <strong>Authentication Issue</strong>
+                <p id="auth-message" class="mb-2"></p>
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+
             <div class="oauth-box text-center">
                 <h4 class="mb-4">Get Started with Pentad</h4>
                 <div class="d-flex justify-content-center gap-4 mb-4 flex-wrap">
                     <div class="oauth-provider">
-                        <a href="{{ url_for('google_login') }}" class="btn btn-outline-danger btn-lg oauth-btn">
+                        <a href="{{ url_for('google_login') }}" class="btn btn-outline-danger btn-lg oauth-btn" id="google-auth-btn">
                             <img src="{{ url_for('static', filename='google-logo.png') }}" width="24" height="24" alt="Google">
                             Sign in with Google
                         </a>
                     </div>
                 </div>
                 <p class="text-muted small">Secure authentication powered by OAuth 2.0</p>
+                
+                <!-- Add manual retry section -->
+                <div class="mt-4">
+                    <button id="clear-session-btn" class="btn btn-outline-secondary btn-sm">
+                        <i class="fas fa-refresh"></i> Clear Session & Retry
+                    </button>
+                </div>
             </div>
         </div>
     </div>
 
     {% else %}
-    <!-- Main Chat Application -->
+    <!-- Main Chat Application (unchanged) -->
     <button id="floating-toggle-btn" class="creative-float-btn" title="Toggle Sidebar">
         <i class="fas fa-bars"></i>
     </button>
@@ -118,9 +132,104 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Check for authentication errors in URL parameters
+        function checkAuthError() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const error = urlParams.get('error');
+            const message = urlParams.get('message');
+            
+            if (error) {
+                const alert = document.getElementById('auth-alert');
+                const messageEl = document.getElementById('auth-message');
+                
+                if (alert && messageEl) {
+                    let errorMessage = 'Authentication failed. ';
+                    
+                    switch(error) {
+                        case 'mismatching_state':
+                            errorMessage += 'CSRF protection error. This usually happens when:';
+                            errorMessage += '<ul class="mt-2 mb-2 small">';
+                            errorMessage += '<li>Using multiple browser tabs</li>';
+                            errorMessage += '<li>Browser cookies are blocked</li>';
+                            errorMessage += '<li>Session expired</li>';
+                            errorMessage += '</ul>';
+                            break;
+                        case 'session_expired':
+                            errorMessage += 'Your session has expired.';
+                            break;
+                        default:
+                            errorMessage += message || 'Please try again.';
+                    }
+                    
+                    messageEl.innerHTML = errorMessage;
+                    alert.style.display = 'block';
+                }
+            }
+        }
+
+        // Clear session and retry authentication
+        function clearSessionAndRetry() {
+            // Clear local storage and session storage
+            localStorage.clear();
+            sessionStorage.clear();
+            
+            // Try to clear cookies by setting expired date
+            document.cookie.split(";").forEach(function(c) {
+                document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/");
+            });
+            
+            // Force reload without cache
+            window.location.href = window.location.origin + '?clear_cache=' + new Date().getTime();
+        }
+
+        // Prevent multiple concurrent auth attempts
+        function setupAuthButton() {
+            const authBtn = document.getElementById('google-auth-btn');
+            if (authBtn) {
+                authBtn.addEventListener('click', function(e) {
+                    // Disable button to prevent multiple clicks
+                    this.style.opacity = '0.6';
+                    this.style.pointerEvents = 'none';
+                    
+                    // Add loading indicator
+                    const originalHTML = this.innerHTML;
+                    this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Redirecting...';
+                    
+                    setTimeout(() => {
+                        this.innerHTML = originalHTML;
+                        this.style.opacity = '1';
+                        this.style.pointerEvents = 'auto';
+                    }, 3000);
+                });
+            }
+        }
+
+        // Initialize authentication handlers
+        document.addEventListener('DOMContentLoaded', function() {
+            {% if not user %}
+            checkAuthError();
+            setupAuthButton();
+            
+            // Setup clear session button
+            const clearBtn = document.getElementById('clear-session-btn');
+            if (clearBtn) {
+                clearBtn.addEventListener('click', clearSessionAndRetry);
+            }
+            
+            // Check if cookies are enabled
+            if (!navigator.cookieEnabled) {
+                const alert = document.getElementById('auth-alert');
+                const messageEl = document.getElementById('auth-message');
+                if (alert && messageEl) {
+                    messageEl.innerHTML = 'Cookies are disabled in your browser. Please enable cookies to use authentication.';
+                    alert.style.display = 'block';
+                }
+            }
+            {% endif %}
+        });
+
         {% if user %}
-        // JavaScript code from your original template goes here
-        // (The same JavaScript you provided in your question)
+        // Your existing JavaScript code for the main application
         /* ---------- DOM ---------- */
         const welcomeScreen = document.getElementById('welcome-screen');
         const chatApp = document.getElementById('chat-app');
@@ -549,5 +658,4 @@
         {% endif %}
     </script>
 </body>
-
 </html>
