@@ -95,7 +95,7 @@ def index():
     user = session.get('user')
     return render_template('index.html', user=user)
 
-@app.route('/google_login')
+@app.route('/login/google')
 def google_login():
     try:
         # Fix 7: Use environment variable for redirect URI
@@ -469,3 +469,4 @@ def health():
 # Vercel compatibility
 def create_app():
     return app
+
