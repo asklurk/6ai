@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -9,6 +8,7 @@ import requests
 import PyPDF2
 from io import BytesIO
 from authlib.integrations.flask_client import OAuth
+from werkzeug.utils import secure_filename
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
@@ -16,21 +16,26 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key-change-in-production")
+
+# Fix 1: Ensure secure secret key from environment variable
+app.secret_key = os.environ.get("SESSION_SECRET")
+if not app.secret_key and os.environ.get("FLASK_ENV") == "production":
+    raise ValueError("SESSION_SECRET environment variable must be set in production")
 
 # Configuration
 app.config.update(
-    SECRET_KEY=os.environ.get("SESSION_SECRET", "dev-secret-key-change-in-production"),
+    SECRET_KEY=app.secret_key,
     GOOGLE_CLIENT_ID=os.environ.get("GOOGLE_CLIENT_ID"),
     GOOGLE_CLIENT_SECRET=os.environ.get("GOOGLE_CLIENT_SECRET"),
 )
 
-CORS(app)
+# Fix 2: Restrict CORS to specific origins
+CORS(app, origins=[os.environ.get("FRONTEND_URL", "http://localhost:3000")])
 
 # Initialize OAuth
 oauth = OAuth(app)
 
-# OAuth Registrations - FIXED for Vercel
+# OAuth Registrations - Fixed for Vercel
 google = oauth.register(
     name='google',
     client_id=app.config["GOOGLE_CLIENT_ID"],
@@ -47,7 +52,14 @@ google = oauth.register(
 
 # Token management
 TOKEN_LIMIT = 300000
-tokens_used = 0
+
+# Fix 4: Store tokens_used in session for user-specific tracking
+def get_user_tokens():
+    return session.get('tokens_used', 0)
+
+def update_user_tokens(tokens):
+    session['tokens_used'] = get_user_tokens() + tokens
+    session.modified = True
 
 def count_tokens(text):
     """Approximate token count by splitting on spaces"""
@@ -57,6 +69,8 @@ def count_tokens(text):
 
 # Initialize OpenRouter API key
 KEY = os.getenv("OPENROUTER_API_KEY")
+# Fix 9: Configurable model
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free")
 
 # AI Models configuration
 MODELS = {
@@ -81,48 +95,41 @@ def index():
     user = session.get('user')
     return render_template('index.html', user=user)
 
-@app.route('google_login')
+@app.route('/google_login')
 def google_login():
     try:
-        # Get the actual deployed URL for redirect
-        if 'VERCEL_URL' in os.environ:
-            base_url = f"https://{os.environ['VERCEL_URL']}"
-        else:
-            base_url = request.url_root.rstrip('/')
-        
+        # Fix 7: Use environment variable for redirect URI
+        base_url = os.environ.get("BASE_URL", "http://localhost:5000")
         redirect_uri = f"{base_url}/login/google/authorize"
         logger.info(f"Starting OAuth with redirect: {redirect_uri}")
-        
         return oauth.google.authorize_redirect(redirect_uri)
     except Exception as e:
+        # Fix 6: Return JSON error response
         logger.error(f"Google login error: {str(e)}", exc_info=True)
-        return f"Authentication error: {str(e)}", 500
+        return jsonify(error="Authentication failed"), 500
 
 @app.route('/login/google/authorize')
 def google_authorize():
     try:
         logger.info("Google authorize endpoint hit")
-        
-        # Get the token
         token = oauth.google.authorize_access_token()
         logger.info("Token received successfully")
         
         if not token:
             logger.error("No token received from Google")
-            return "Authentication failed: No token received", 400
-            
-        # Get user info
+            return jsonify(error="Authentication failed: No token received"), 400
+        
         resp = oauth.google.get('userinfo', token=token)
         logger.info(f"User info response status: {resp.status_code}")
         
         if resp.status_code != 200:
             logger.error(f"Google API error: {resp.status_code} - {resp.text}")
-            return f"Failed to fetch user information: {resp.status_code}", 400
-            
-        user_info = resp.json()
-        logger.info(f"User info received: {user_info.get('email')}")
+            return jsonify(error=f"Failed to fetch user information: {resp.status_code}"), 400
         
-        # Store user in session
+        user_info = resp.json()
+        # Fix 10: Avoid logging sensitive information
+        logger.info("User info received")
+        
         session['user'] = {
             'name': user_info.get('name', 'User'),
             'email': user_info.get('email', ''),
@@ -130,22 +137,19 @@ def google_authorize():
             'provider': 'google'
         }
         
-        # Ensure session is saved
         session.modified = True
-        
-        logger.info(f"User logged in successfully: {user_info.get('email')}")
+        logger.info("User logged in successfully")
         return redirect(url_for('index'))
     
     except Exception as e:
         logger.error(f"Google auth error: {str(e)}", exc_info=True)
-        return f"Authentication failed: {str(e)}", 400
+        return jsonify(error="Authentication failed"), 400
 
 @app.route('/logout')
 def logout():
     session.pop('user', None)
+    session.pop('tokens_used', None)  # Fix 4: Reset user-specific tokens
     return redirect(url_for('index'))
-
-# ... (keep the rest of your existing functions: extract_text_from_pdf, generate, chat, asklurk, upload, get_tokens, reset_tokens, health) ...
 
 # File processing
 def extract_text_from_pdf(file_content):
@@ -162,29 +166,26 @@ def extract_text_from_pdf(file_content):
 
 # AI Generation using direct HTTP requests
 def generate(bot_name: str, system: str, user: str, file_contents: list = None):
-    global tokens_used
     if not KEY:
         yield f"data: {json.dumps({'bot': bot_name, 'error': 'OpenRouter API key not configured'})}\n\n"
         return
-        
+    
     try:
         full_user_prompt = user
         if file_contents:
             file_context = "\n\n".join(file_contents)
             full_user_prompt = f"{user}\n\nAttached files content:\n{file_context}"
         
-        # Check if user is logged in
         if not session.get('user'):
             yield f"data: {json.dumps({'bot': bot_name, 'error': 'Please login first'})}\n\n"
             return
         
-        # Approximate token counting
         system_tokens = count_tokens(system)
         user_tokens = count_tokens(full_user_prompt)
-        tokens_used += system_tokens + user_tokens
+        update_user_tokens(system_tokens + user_tokens)  # Fix 4: Update user-specific tokens
         
         payload = {
-            "model": "deepseek/deepseek-chat-v3.1:free",
+            "model": OPENROUTER_MODEL,  # Fix 9: Use configurable model
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": full_user_prompt}
@@ -236,9 +237,9 @@ def generate(bot_name: str, system: str, user: str, file_contents: list = None):
                     except json.JSONDecodeError:
                         continue
         
-        tokens_used += bot_tokens
-        yield f"data: {json.dumps({'bot': bot_name, 'done': True, 'tokens': tokens_used})}\n\n"
-        
+        update_user_tokens(bot_tokens)  # Fix 4: Update user-specific tokens
+        yield f"data: {json.dumps({'bot': bot_name, 'done': True, 'tokens': get_user_tokens()})}\n\n"
+    
     except Exception as exc:
         logger.error(f"Generation error for {bot_name}: {str(exc)}")
         error_msg = f"Failed to generate response: {str(exc)}"
@@ -247,7 +248,6 @@ def generate(bot_name: str, system: str, user: str, file_contents: list = None):
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
-        # Check if user is logged in
         if not session.get('user'):
             return jsonify(error="Please login first"), 401
         
@@ -255,16 +255,33 @@ def chat():
         prompt = data.get("prompt", "").strip()
         fileUrls = data.get("fileUrls", [])
         
+        # Fix 11: Validate prompt length
+        if len(prompt) > 5000:
+            return jsonify(error="Prompt too long (max 5000 characters)"), 400
+        
         if not prompt and not fileUrls:
             return jsonify(error="Empty prompt and no files provided"), 400
         
-        if tokens_used >= TOKEN_LIMIT:
-            return jsonify(error=f"Token limit reached ({tokens_used}/{TOKEN_LIMIT})"), 429
+        if get_user_tokens() >= TOKEN_LIMIT:
+            return jsonify(error=f"Token limit reached ({get_user_tokens()}/{TOKEN_LIMIT})"), 429
         
+        # Fix 8: Extract file contents if URLs point to accessible files
         file_contents = []
         if fileUrls:
             for file_url in fileUrls:
-                file_contents.append(f"File attached: {file_url}")
+                try:
+                    response = requests.get(file_url, timeout=10)
+                    if response.status_code == 200 and file_url.lower().endswith('.pdf'):
+                        content = extract_text_from_pdf(response.content)
+                        if content:
+                            file_contents.append(content)
+                        else:
+                            file_contents.append(f"File at {file_url}: Unable to extract content")
+                    else:
+                        file_contents.append(f"File at {file_url}: Unable to access or not a PDF")
+                except Exception as e:
+                    logger.error(f"Error fetching file {file_url}: {str(e)}")
+                    file_contents.append(f"File at {file_url}: Error accessing file")
 
         def event_stream():
             generators = {}
@@ -285,14 +302,14 @@ def chat():
                                 active_bots.remove(bot_name)
                         except:
                             pass
-                            
+                        
                     except StopIteration:
                         active_bots.remove(bot_name)
                     except Exception as e:
                         logger.error(f"Stream error for {bot_name}: {str(e)}")
                         active_bots.remove(bot_name)
             
-            yield f"data: {json.dumps({'all_done': True, 'tokens': tokens_used})}\n\n"
+            yield f"data: {json.dumps({'all_done': True, 'tokens': get_user_tokens()})}\n\n"
 
         return Response(
             event_stream(),
@@ -305,19 +322,22 @@ def chat():
         )
     
     except Exception as e:
-        logger.error(f"Chat error: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+        logger.error(f"Chat error: {str(e)}")
+        return jsonify(error="Internal server error"), 500
 
 @app.route("/asklurk", methods=["POST"])
 def asklurk():
     try:
-        # Check if user is logged in
         if not session.get('user'):
             return jsonify(best="", error="Please login first"), 401
         
         data = request.json or {}
         answers = data.get("answers", {})
         prompt = data.get("prompt", "")
+        
+        # Fix 11: Validate input
+        if len(prompt) > 5000:
+            return jsonify(best="", error="Prompt too long (max 5000 characters)"), 400
         
         if not answers:
             return jsonify(best="", error="No responses to analyze"), 400
@@ -332,7 +352,7 @@ def asklurk():
                     merged_content += f"## {MODELS[key]['name']}:\n{response}\n\n"
             
             payload = {
-                "model": "deepseek/deepseek-chat-v3.1:free",
+                "model": OPENROUTER_MODEL,  # Fix 9: Use configurable model
                 "messages": [
                     {
                         "role": "system",
@@ -367,21 +387,20 @@ def asklurk():
             result = response.json()
             best_answer = result['choices'][0]['message']['content']
             asklurk_tokens = count_tokens(best_answer)
-            global tokens_used
-            tokens_used += asklurk_tokens
+            update_user_tokens(asklurk_tokens)  # Fix 4: Update user-specific tokens
             
-            return jsonify(best=best_answer, tokens_used=tokens_used)
-            
+            return jsonify(best=best_answer, tokens_used=get_user_tokens())
+        
         except Exception as e:
             logger.error(f"AskLurk error: {str(e)}")
             if answers:
                 first_response = next(iter(answers.values()))
                 return jsonify(best=f"Fallback - Using first response:\n\n{first_response}", error="AI synthesis failed")
             return jsonify(best="", error="No responses available for synthesis")
-        
+    
     except Exception as e:
-        logger.error(f"AskLurk error: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+        logger.error(f"AskLurk error: {str(e)}")
+        return jsonify(error="Internal server error"), 500
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -393,34 +412,50 @@ def upload():
         files = request.files.getlist('files')
         urls = []
         
+        # Fix 5: Validate file types and sizes
+        ALLOWED_EXTENSIONS = {'pdf'}
+        MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+        
         for file in files:
             if file.filename == '':
                 continue
             
-            # In Vercel, we can't save files permanently, so we return mock URLs
-            name = f"{uuid.uuid4().hex}_{file.filename}"
+            # Validate file extension
+            if not '.' in file.filename or file.filename.rsplit('.', 1)[1].lower() not in ALLOWED_EXTENSIONS:
+                continue
+            
+            # Validate file size
+            file.seek(0, os.SEEK_END)
+            file_size = file.tell()
+            if file_size > MAX_FILE_SIZE:
+                continue
+            file.seek(0)
+            
+            # In Vercel, use in-memory processing
+            name = f"{uuid.uuid4().hex}_{secure_filename(file.filename)}"
             urls.append(f"/static/uploads/{name}")
+            # Note: For persistent storage, integrate with S3 or similar
         
         return jsonify(urls=urls)
     
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return jsonify({'error': 'File upload not available in demo'}), 500
+        logger.error(f"Upload error: {str(e)}")
+        return jsonify(error="File upload failed"), 500
 
 @app.route("/tokens", methods=["GET"])
 def get_tokens():
     return jsonify({
-        "tokens_used": tokens_used,
+        "tokens_used": get_user_tokens(),
         "token_limit": TOKEN_LIMIT,
-        "remaining_tokens": TOKEN_LIMIT - tokens_used,
-        "usage_percentage": (tokens_used / TOKEN_LIMIT) * 100
+        "remaining_tokens": TOKEN_LIMIT - get_user_tokens(),
+        "usage_percentage": (get_user_tokens() / TOKEN_LIMIT) * 100
     })
 
 @app.route("/reset-tokens", methods=["POST"])
 def reset_tokens():
-    global tokens_used
-    tokens_used = 0
-    return jsonify({"message": "Token counter reset", "tokens_used": tokens_used})
+    session['tokens_used'] = 0  # Fix 4: Reset user-specific tokens
+    session.modified = True
+    return jsonify({"message": "Token counter reset", "tokens_used": get_user_tokens()})
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -428,14 +463,9 @@ def health():
         "status": "ok",
         "api_key_configured": bool(KEY),
         "models_configured": len(MODELS),
-        "tokens_used": tokens_used
+        "tokens_used": get_user_tokens()
     })
 
 # Vercel compatibility
 def create_app():
     return app
-
-# For local development
-if __name__ == '__main__':
-    app.run(debug=True)
-
