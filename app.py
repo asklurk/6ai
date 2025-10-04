@@ -81,7 +81,7 @@ def index():
     user = session.get('user')
     return render_template('index.html', user=user)
 
-@app.route('/login/google')
+@app.route('google_login')
 def google_login():
     try:
         # Get the actual deployed URL for redirect
@@ -438,3 +438,4 @@ def create_app():
 # For local development
 if __name__ == '__main__':
     app.run(debug=True)
+
